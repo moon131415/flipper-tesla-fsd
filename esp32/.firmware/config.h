@@ -41,6 +41,26 @@
 #define CAN_ID_VCSEC_WINDOW    0x119u // 281  - VCSEC_windowRequests: windows
 #define CAN_ID_DAS_BODY        0x3E9u // 1001 - DAS_bodyControls: lights/hazards/turn/wipers
 
+// ── Board combination ───────────────────────────────────────────────────────
+// A Waveshare ESP32-S3-RS485-CAN with a separate MCP2515 module wired to the
+// pin header: the board's own (isolated) transceiver on the native TWAI
+// controller is can0, the MCP2515 is can1 — the same two-bus layout as a
+// LilyGO T-2CAN. Both flags come from platformio.ini.
+#if defined(BOARD_WAVESHARE_S3) && defined(CAN_DRIVER_T2CAN_DUAL)
+#define BOARD_WAVESHARE_S3_DUALCAN 1
+#endif
+
+// Boards that run the CAN-idle deep-sleep watchdog (sleep_tick() in main.cpp).
+// Needs a CAN RX pin that is an RTC GPIO (so it can wake the chip) and a TX
+// pin whose level can be latched while the digital domain is off.
+//   BOARD_LILYGO  (T-CAN485):  classic ESP32, SN65HVD230 RXD on GPIO 26.
+//   WAVESHARE_S3_DUALCAN:      ESP32-S3, TWAI RX on GPIO 16 (GPIO 0-21 are the
+//                              RTC GPIOs on the S3), plus the MCP2515 INT pin
+//                              as a second wake source.
+#if defined(BOARD_LILYGO) || defined(BOARD_WAVESHARE_S3_DUALCAN)
+#define CAN_DEEP_SLEEP_ENABLED 1
+#endif
+
 // ── Build identity ────────────────────────────────────────────────────────────
 // Board name for the boot banner and the dashboard — same wording as the board
 // table in esp32/README.md. One entry per BOARD_* flag in platformio.ini.
@@ -52,6 +72,8 @@
   #define BOARD_NAME "LilyGO T-CAN485"
 #elif defined(BOARD_TTGO_DISPLAY)
   #define BOARD_NAME "TTGO T-Display + MCP2515"
+#elif defined(BOARD_WAVESHARE_S3_DUALCAN)
+  #define BOARD_NAME "Waveshare ESP32-S3-RS485-CAN + MCP2515 (dual CAN)"
 #elif defined(BOARD_WAVESHARE_S3)
   #define BOARD_NAME "Waveshare ESP32-S3-RS485-CAN"
 #elif defined(BOARD_M5STACK_ATOM_MATRIX)
@@ -121,6 +143,57 @@
   #define PIN_MCP_SCK        33
   #define PIN_MCP_MOSI       25
   #define PIN_MCP_CS         26
+#elif defined(BOARD_WAVESHARE_S3_DUALCAN)
+  // Waveshare ESP32-S3-RS485-CAN + a separate MCP2515 module = dual CAN, the
+  // same bus layout as a LilyGO T-2CAN (can0 = native TWAI, can1 = MCP2515).
+  // Every pin below can be overridden with a build flag.
+  //
+  // IMPORTANT — the two pairs are NOT interchangeable:
+  //   * PIN_CAN_TX/RX is the board's own isolated CAN transceiver, hardwired to
+  //     GPIO 15/16 by Waveshare. Nothing else may use those two pins.
+  //   * The MCP2515 is wired by hand to the pin header, where IO3-IO14 are
+  //     free. IO19/IO20 are the ESP32-S3's native USB D-/D+ pair and IO43/IO44
+  //     the UART0 console — never route the MCP2515 there.
+  //   * GPIO 35-37 are the in-package octal PSRAM (ESP32-S3R8) and GPIO 26-32
+  //     the in-package flash: not available on any S3-WROOM module.
+  #ifndef PIN_CAN_TX
+  #define PIN_CAN_TX         15   // TWAI TX -> Waveshare CAN transceiver TXD
+  #endif
+  #ifndef PIN_CAN_RX
+  #define PIN_CAN_RX         16   // TWAI RX <- Waveshare CAN transceiver RXD (RTC GPIO: deep-sleep wake)
+  #endif
+  #ifndef PIN_LED
+  #define PIN_LED            46
+  #endif
+  #ifndef PIN_MCP_CS
+  #define PIN_MCP_CS         10
+  #endif
+  #ifndef PIN_MCP_SCK
+  #define PIN_MCP_SCK        12
+  #endif
+  #ifndef PIN_MCP_MOSI
+  #define PIN_MCP_MOSI       11
+  #endif
+  #ifndef PIN_MCP_MISO
+  #define PIN_MCP_MISO       13
+  #endif
+  // INT doubles as the deep-sleep wake source for can1, so it is wired (the
+  // T-Display build leaves it unconnected and polls instead). RST lets the
+  // driver hard-reset the chip after a deep-sleep wake, when the MCP2515 has
+  // kept its configuration across the ESP32's reset.
+  #ifndef PIN_MCP_INT
+  #define PIN_MCP_INT        9
+  #endif
+  #ifndef PIN_MCP_RST
+  #define PIN_MCP_RST        8
+  #endif
+  // Commodity MCP2515 breakout modules ship an 8 MHz crystal; the LilyGO
+  // T-2CAN's onboard chip is the 16 MHz exception. Spelled out here so the
+  // value never depends on which branch of the fallthrough below is taken.
+  #ifndef MCP_CRYSTAL_MHZ
+  #define MCP_CRYSTAL_MHZ    MCP_8MHZ
+  #endif
+  #define PRECONDITION_TX_BUS_INDEX 0
 #else
   #ifndef PIN_CAN_TX
   #define PIN_CAN_TX   22   // TWAI TX → ATOMIC CAN Base TX
@@ -165,7 +238,9 @@
 // The Continuous AP 0x229 press only goes out on a bus where the car's own
 // 0x229 is live (gear_tx_route.h); this picks the bus when both carry it.
 #ifndef GEAR_LEVER_TX_BUS_INDEX
-#if defined(BOARD_LILYGO_T2CAN)
+#if defined(BOARD_LILYGO_T2CAN) || defined(BOARD_WAVESHARE_S3_DUALCAN)
+// Both dual-CAN builds wire the MCP2515 (can1) to the pair carrying the car's
+// 0x229 in the documented setups, so the generated gear press starts there.
 #define GEAR_LEVER_TX_BUS_INDEX 1
 #else
 #define GEAR_LEVER_TX_BUS_INDEX 0
@@ -232,10 +307,20 @@
   #define ME2107_EN 16
 #endif
 
-// ── Deep sleep (BOARD_LILYGO only) ───────────────────────────────────────────
-// SN65HVD230 RXD (= PIN_CAN_RX, GPIO 26) is an RTC-capable GPIO on ESP32.
-// When the CAN bus goes dominant the pin goes LOW — used as ext0 wakeup source.
-// The SN65HVD230 Rs pin has an internal 100 kΩ pull-down, so it stays in
-// normal-receive mode when GPIO 23 floats during deep sleep.
+// ── Deep sleep (CAN_DEEP_SLEEP_ENABLED boards) ──────────────────────────────
+// Two wake sources, both RTC GPIOs:
+//
+//   ext0 — the TWAI RX pin (BOARD_LILYGO: GPIO 26; Waveshare dual: GPIO 16).
+//          The transceiver's RXD goes LOW when the bus goes dominant, so a
+//          frame on can0 wakes the chip.
+//   ext1 — the MCP2515 INT pin (Waveshare dual only, GPIO 9), active LOW, so a
+//          frame on can1 wakes it too. The chip keeps its own power through the
+//          sleep and is left in Listen-Only mode (it must stay on the bus to
+//          see traffic; shutdown()'s CONFIG mode would leave the bus unwatched
+//          and the device unable to wake from can1).
+//
+// The TX pad is latched recessive with gpio_hold_en() before sleeping: pads
+// lose their driven level once the digital domain powers down, and a TX left
+// floating could read as dominant and block the car's bus.
 #define SLEEP_IDLE_MS   120000u   // CAN silence before entering deep sleep
 #define SLEEP_WARN_MS    5000u   // serial/log warning this many ms before sleep

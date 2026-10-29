@@ -180,6 +180,7 @@ Any ESP32 board + CAN transceiver works. Pick the matching build env in `platfor
 | `lilygo-t2can` | LilyGO-T2CAN | TWAI/MCP2515 SPI | 7 / 6 | ESP32-S3-WROOM-1U (MCN16R8) with MCP2515; the 8 MB PSRAM holds the black-box ring (40000 frames) |
 | `lilygo-t2can-fd` | LilyGO T-2CAN FD (H784-A) | TWAI/MCP2518FD SPI | 7 / 6 | Same board with an MCP2518FD on `can1`, classic CAN 2.0 at 500 kbps; PSRAM as on `lilygo-t2can`; not yet confirmed on real hardware |
 | `waveshare-s3-can` | Waveshare ESP32-S3-RS485-CAN | TWAI | 15 / 16 | ESP32-S3R8 (8 MB octal PSRAM in the chip) with 16 MB flash, USB-CDC. The build uses 8 MB of the flash and doesn't enable the PSRAM yet (board default memory type, no `BOARD_HAS_PSRAM`), so the black-box ring is the internal-RAM one (6000 frames) |
+| `waveshare-s3-dual-can` | Waveshare ESP32-S3-RS485-CAN **+ MCP2515 module** | TWAI/MCP2515 SPI (dual) | 15 / 16 + MCP CS=10 SCK=12 MISO=13 MOSI=11 INT=9 RST=8 | Two independent buses like a T-2CAN: `can0` = the board's own isolated transceiver, `can1` = the MCP2515, 8 MHz. Has the deep-sleep watchdog. See the wiring section below |
 | `esp32-generic-twai` | Classic ESP32 DevKit + SN65HVD230 | TWAI | 21 / 22 | No LED; build from source (no prebuilt image) |
 | `esp32-generic-twai-sniffer` | Classic ESP32 DevKit + SN65HVD230 | TWAI (hardware Listen-Only) | 21 / 22 | `SNIFFER_ONLY`: can never transmit; build from source |
 | other | Any ESP32 / ESP32-S3 + CAN transceiver | TWAI | any two pins | Copy the closest env and override `PIN_CAN_TX` / `PIN_CAN_RX` (the envs target classic ESP32 or ESP32-S3; there is no ESP32-C3 env) |
@@ -249,6 +250,70 @@ The FD version has an MCP2518FD where the classic board has the MCP2515, on the 
 - At every boot the driver starts the MCP2518FD in Listen-Only and measures its crystal (40 MHz on LilyGO's schematic). If the measurement doesn't match, `can1` stays off the bus and the serial log says what it measured.
 - The MCP2518FD has no reset pin. GPIO 9 goes to its INT0/GPIO0 pin and GPIO 3 (through the DIP switch next to the chip) to INT1/GPIO1; the firmware drives neither.
 - Not yet confirmed on real hardware. Start in Listen-Only and check that `can1` receives before you switch to Active.
+
+### Waveshare ESP32-S3-RS485-CAN + MCP2515 (dual CAN)
+
+The Waveshare board has one isolated CAN transceiver on the ESP32-S3's native
+TWAI controller (GPIO 15/16). Add a commodity MCP2515 module on the pin header
+and it becomes a two-bus device with the same layout as a T-2CAN: `can0` =
+native TWAI, `can1` = MCP2515. Build with `waveshare-s3-dual-can`.
+
+| MCP2515 pin | Waveshare GPIO | Notes |
+|-------------|----------------|-------|
+| CS | 10 | |
+| SCK | 12 | |
+| MISO / SO | 13 | **Needs a 5 V → 3.3 V divider** if the module is powered from 5 V — see the T-Display warning above |
+| MOSI / SI | 11 | 3.3 V out from the ESP32, no divider |
+| INT | 9 | Wired — it is the `can1` deep-sleep wake source |
+| RST | 8 | Lets the driver hard-reset the chip after a deep-sleep wake |
+| VCC | 5V | Needed by the TJA1050 transceiver on most modules |
+| GND | GND | Common ground with the X179 supply |
+
+Which pairs **not** to use on the Waveshare header: GPIO 19/20 are the
+ESP32-S3's native USB D-/D+, GPIO 43/44 the UART0 console, GPIO 26-32 the
+in-package flash and GPIO 33-37 the in-package octal PSRAM — none of them is
+routable to the MCP2515. IO3-IO14 are free.
+
+The MCP2515 module's crystal is 8 MHz on virtually every breakout board, which
+is what this env sets (`-D MCP_CRYSTAL_MHZ=MCP_8MHZ`); the LilyGO T-2CAN's
+onboard chip is the 16 MHz exception. If `can1` reports
+`MCP2515 NOT detected on SPI`, the crystal value is the first thing to check.
+
+Wiring: `can0` (the board's own CAN terminal) and `can1` (the MCP2515's
+terminal) each go to one X179 pair — see the T-2CAN bus table above for which
+functions live on which vehicle network.
+
+#### Deep sleep
+
+`waveshare-s3-dual-can` is one of the two builds with the CAN-idle deep-sleep
+watchdog (the other is `esp32-lilygo`, the T-CAN485). After
+`sleep_idle_ms` (default 120 s, settable from the dashboard) of silence on the
+bus, the board parks both controllers, latches the TWAI TX pad recessive and
+goes to deep sleep. Two wake sources, both RTC GPIOs:
+
+- **ext0** — TWAI RX (GPIO 16): the transceiver's RXD goes LOW while the bus is
+  dominant, so any frame on `can0` wakes it.
+- **ext1** — MCP2515 INT (GPIO 9): the chip keeps its own supply and is parked
+  in Listen-Only with its RX interrupts armed, so a frame on `can1` wakes it.
+
+How deep the sleep actually goes is set by the **board**, not the firmware: the
+Waveshare's isolated CAN/RS485 transceivers, its USB-serial chip and its
+regulator keep drawing current with the ESP32-S3 itself at a few tens of µA, so
+expect milliamps rather than microamps at the 12 V input. The firmware cannot
+power those down — unlike the T-CAN485, whose `ME2107_EN` cuts the 5 V rail,
+the Waveshare exposes no transceiver standby pin. If parasitic drain matters,
+feed the board from a switched 12 V source rather than an always-on one (the
+power log's 12 V-feed verdict will tell you which you have).
+
+Two things worth knowing before you rely on it:
+
+- The MCP2515 stays in Listen-Only across the sleep so it can watch `can1`. It
+  therefore keeps consuming its own quiescent current. `SLEEP_MCP2515_LOWPOWER`
+  switches it to the chip's own sleep mode with wake-on-bus instead — lower
+  draw, but not confirmed on hardware, and a chip that fails to wake leaves the
+  board asleep until you power-cycle it.
+- A deep-sleep wake is a reset. The black-box ring, the CAN capture and the web
+  dashboard session do not survive it; NVS settings and the power log do.
 
 ### OBD-II (Primary — Plug & Play)
 

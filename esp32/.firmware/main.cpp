@@ -43,8 +43,9 @@
 #if defined(BOARD_TTGO_DISPLAY)
 #include "display.h"
 #endif
-#if defined(BOARD_LILYGO)
-#include <driver/gpio.h>   // CAN TX pad hold across deep sleep
+#if defined(CAN_DEEP_SLEEP_ENABLED)
+#include <driver/gpio.h>      // CAN TX pad hold across deep sleep
+#include <driver/rtc_gpio.h>  // pull-ups on the wake pads, held through sleep
 #endif
 
 // Loop task stack. The Arduino default is 8 KB, and the dashboard's deepest
@@ -1016,13 +1017,13 @@ static bool     g_btn2_down        = false;
 static bool     g_btn2_ignore_boot = true;
 #endif
 
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
 static uint32_t g_last_can_rx_ms = 0;
 static bool     g_sleep_warned   = false;
 #endif
 
 // Last CAN frame time + "seen anything yet", for the power/12V log on every
-// board (the LilyGO sleep timer above is a separate, board-only counter).
+// board (the deep-sleep timer above is a separate, sleep-enabled counter).
 static uint32_t g_power_last_rx_ms = 0;
 static bool     g_power_seen_any   = false;
 
@@ -1251,7 +1252,7 @@ static NOINLINE void process_frame(CanBusId bus, const CanFrame &frame) {
     // Injection safety is preserved by never installing the single-ID hardware
     // filter in Active mode (see the acceptance-filter block in loop()).
     http_can_stream_record(bus, frame);
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
     g_last_can_rx_ms = millis();
     g_sleep_warned   = false;
 #endif
@@ -1702,8 +1703,22 @@ static NOINLINE void process_frame(CanBusId bus, const CanFrame &frame) {
     }
 }
 
-#if defined(BOARD_LILYGO)
-// ── Deep-sleep watchdog (Lilygo only) ────────────────────────────────────────
+#if defined(CAN_DEEP_SLEEP_ENABLED)
+// ── Deep-sleep watchdog ──────────────────────────────────────────────────────
+// Two independent wake sources, so traffic on either bus brings the board back:
+//   ext0 — the TWAI RX pad. The transceiver's RXD goes LOW while the bus is
+//          dominant, so any frame on can0 wakes the chip.
+//   ext1 — the MCP2515's INT pad. The chip keeps its own supply through the
+//          sleep and is parked in Listen-Only with its RX interrupts armed
+//          (Mcp2515Driver::prepareForSleep), so a frame on can1 asserts INT.
+// Only RTC GPIOs can wake the chip: GPIO 0-21 on the ESP32-S3, which both
+// PIN_CAN_RX and PIN_MCP_INT must fall inside.
+#if defined(CAN_HAS_MCP2515) && (PIN_MCP_INT >= 0)
+#define SLEEP_EXT1_WAKE_GPIO PIN_MCP_INT
+#else
+#define SLEEP_EXT1_WAKE_GPIO -1
+#endif
+
 static NOINLINE void sleep_tick(uint32_t now) {
     // A capture's hardware filter on a rare id makes a busy bus look silent:
     // that is not a sleeping car. Hold the idle timer at zero while it is on,
@@ -1729,16 +1744,41 @@ static NOINLINE void sleep_tick(uint32_t now) {
         can_dump_stop();
         sd_syslog_close();
         led_set(LED_SLEEP);
-        // Leave the bus quiesced: TWAI stopped + uninstalled, TX driven
-        // recessive (same path as the pre-reboot quiesce, #180). Pads lose their
-        // driven level once the digital domain powers down, so latch TX. GPIO 27
-        // is an RTC pad: gpio_hold_en() takes the RTC hold, which persists through
-        // deep sleep and the wake reset. setup() releases it before TWAI starts.
-        can_shutdown_all(g_can, CAN_ACTIVE_BUS_COUNT);
+        // Park the controllers rather than stopping them outright: can1 has to
+        // stay on the bus as a silent listener or its INT can never fire, and
+        // can0 must stop ACKing. See can_driver.cpp's prepareForSleep().
+        can_prepare_sleep_all(g_can, CAN_ACTIVE_BUS_COUNT);
+        // Leave the bus quiesced: TX driven recessive and then latched. Pads
+        // lose their driven level once the digital domain powers down, so take
+        // the RTC hold, which persists through deep sleep and the wake reset.
+        // setup() releases it before TWAI starts.
         bool tx_held = gpio_hold_en((gpio_num_t)PIN_CAN_TX) == ESP_OK;
         Serial.printf("[SLEEP] CAN TX (GPIO %d) %s recessive\n",
                       PIN_CAN_TX, tx_held ? "held" : "NOT held");
+
+        // The INT pull-up lives in the RTC IO mux, which is only powered during
+        // deep sleep if the RTC_PERIPH domain stays on. Without it an
+        // open-drain INT floats and either never wakes us or wakes us forever.
+        // A few tens of µA, and the board's own regulator and transceivers draw
+        // orders of magnitude more anyway.
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
         esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_CAN_RX, 0);
+#if SLEEP_EXT1_WAKE_GPIO >= 0
+        if (rtc_gpio_is_valid_gpio((gpio_num_t)SLEEP_EXT1_WAKE_GPIO)) {
+            rtc_gpio_init((gpio_num_t)SLEEP_EXT1_WAKE_GPIO);
+            rtc_gpio_set_direction((gpio_num_t)SLEEP_EXT1_WAKE_GPIO,
+                                   RTC_GPIO_MODE_INPUT_ONLY);
+            rtc_gpio_pullup_en((gpio_num_t)SLEEP_EXT1_WAKE_GPIO);
+            esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_EXT1_WAKE_GPIO,
+                                         ESP_EXT1_WAKEUP_ANY_LOW);
+            Serial.printf("[SLEEP] ext1 wake: MCP2515 INT (GPIO %d), low\n",
+                          SLEEP_EXT1_WAKE_GPIO);
+        } else {
+            Serial.printf("[SLEEP] MCP2515 INT (GPIO %d) is not an RTC GPIO — "
+                          "can1 cannot wake the board\n", SLEEP_EXT1_WAKE_GPIO);
+        }
+#endif
+        Serial.printf("[SLEEP] ext0 wake: TWAI RX (GPIO %d), low\n", PIN_CAN_RX);
         esp_deep_sleep_start();
         // never returns
     } else if (!g_sleep_warned && idle_ms >= (s.sleep_idle_ms - SLEEP_WARN_MS)) {
@@ -1752,7 +1792,7 @@ static NOINLINE void sleep_tick(uint32_t now) {
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
     g_last_can_rx_ms = millis();
 #endif
     Serial.begin(115200);
@@ -1775,7 +1815,11 @@ void setup() {
 #if defined(CAN_DRIVER_T2CAN_DUAL) && defined(BOARD_LILYGO_T2CAN_FD)
     Serial.println("[CAN] Driver: LilyGO T-2CAN FD dual CAN (TWAI can0 + MCP2518FD can1, classic CAN)");
 #elif defined(CAN_DRIVER_T2CAN_DUAL)
+  #if defined(BOARD_WAVESHARE_S3_DUALCAN)
+    Serial.println("[CAN] Driver: Waveshare dual CAN (TWAI can0 + MCP2515 can1, 8 MHz)");
+  #else
     Serial.println("[CAN] Driver: LilyGO T-2CAN dual CAN (TWAI can0 + MCP2515 can1)");
+  #endif
 #elif defined(CAN_DRIVER_TWAI)
   #if defined(BOARD_WAVESHARE_S3)
     Serial.println("[CAN] Driver: ESP32-S3 TWAI (Waveshare ESP32-S3-RS485-CAN)");
@@ -1788,18 +1832,21 @@ void setup() {
     Serial.println("[CAN] Driver: MCP2515 via SPI");
 #endif
 
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
     // Release the deep-sleep TX hold (sleep_tick) before anything starts TWAI:
     // the hold survives the wake reset (IDF only auto-releases ext1 wake pads)
     // and a held pad ignores the controller, so TX would stay dead. Program the
     // held state (output, recessive) first so the release can't blip dominant.
-    // Runs every boot, ahead of the 5V rail and Rs; the release is a no-op
-    // after a cold boot.
+    // Runs every boot; the release is a no-op after a cold boot.
     digitalWrite(PIN_CAN_TX, HIGH);
     pinMode(PIN_CAN_TX, OUTPUT);
     digitalWrite(PIN_CAN_TX, HIGH);
     gpio_hold_dis((gpio_num_t)PIN_CAN_TX);
+#endif
 
+#if defined(BOARD_LILYGO)
+    // T-CAN485 only: its 5 V rail feeds the SD slot, and its transceiver has an
+    // Rs/standby pin that has to be driven LOW or TX is impossible.
     pinMode(ME2107_EN, OUTPUT);
     digitalWrite(ME2107_EN, HIGH);
     delay(100); // Wait for 5V rail to stabilize (SD power)
@@ -1886,11 +1933,18 @@ void setup() {
     capability_init(&g_state, &g_state_mux);  // tap capability checker (#125)
     profile_match_init(&g_state, &g_state_mux);  // variant-profile auto-suggest (#126)
 
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
     {
         esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
         if (cause == ESP_SLEEP_WAKEUP_EXT0) {
-            Serial.printf("[WAKE] Woken by CAN activity (EXT0 GPIO %d)\n", PIN_CAN_RX);
+            Serial.printf("[WAKE] Woken by can0 traffic (EXT0 TWAI RX GPIO %d)\n", PIN_CAN_RX);
+        } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+#if SLEEP_EXT1_WAKE_GPIO >= 0
+            Serial.printf("[WAKE] Woken by can1 traffic (EXT1 MCP2515 INT GPIO %d)\n",
+                          SLEEP_EXT1_WAKE_GPIO);
+#else
+            Serial.println("[WAKE] Woken by EXT1");
+#endif
         } else if (cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
             Serial.printf("[WAKE] Wakeup cause=%d\n", (int)cause);
         }
@@ -1990,11 +2044,11 @@ void loop() {
     ota_verify_tick(now);
     g_loop_health.mark(LOOP_STAGE_OTHER, micros());
 
-    // Drain all available CAN frames in one shot. On LilyGO T-2CAN, can1 is the
-    // SPI controller, read only when polled (the MCP2515 has just two RX
-    // buffers, the T-2CAN FD's MCP2518FD a 32-frame FIFO), so poll it before
-    // and after can0.
-#if defined(CAN_DRIVER_T2CAN_DUAL) && defined(BOARD_LILYGO_T2CAN)
+    // Drain all available CAN frames in one shot. Whenever can1 is an SPI
+    // controller (T-2CAN and the Waveshare dual build) it is read only when
+    // polled — the MCP2515 has just two RX buffers, the T-2CAN FD's MCP2518FD a
+    // 32-frame FIFO — so poll it before and after can0.
+#if defined(CAN_DRIVER_T2CAN_DUAL)
     drain_can_bus_index(1);
     drain_can_bus_index(0);
     drain_can_bus_index(1);
@@ -2175,7 +2229,7 @@ void loop() {
     // capture filter hides most of the bus.
     power_log_tick(now, g_power_last_rx_ms, g_power_seen_any, g_can_filtered);
 
-#if defined(BOARD_LILYGO)
+#if defined(CAN_DEEP_SLEEP_ENABLED)
     sleep_tick(now);
 #endif
     g_loop_health.mark(LOOP_STAGE_LOGS, micros());

@@ -431,6 +431,33 @@ class Mcp2515Driver : public CanDriver {
         static_cast<Mcp2515Driver *>(arg)->rx_task_run();
     }
 
+    // Which SPI object this instance talks on: the T-Display keeps its LCD on
+    // the default bus, so its MCP2515 gets a private one.
+    SPIClass *spi_bus() {
+#if defined(BOARD_TTGO_DISPLAY)
+        return &spi_;
+#else
+        return &SPI;
+#endif
+    }
+
+    // One raw register write. The library keeps read/write/modify private, and
+    // the deep-sleep hand-off needs MCP_CANINTE, which it never exposes:
+    // reset() arms RX0IE|RX1IE|ERRIE|MERRE, and an error flag latched while the
+    // ESP32 sleeps would hold INT low forever and wake the board in a loop.
+    // Addresses/bits are the MCP2515 datasheet values (the library's REGISTER
+    // and CANINTF enums are private, but use the same numbers).
+    void mcp_write_reg(uint8_t reg, uint8_t value) {
+        SPIClass *s = spi_bus();
+        s->beginTransaction(SPISettings(8000000u, MSBFIRST, SPI_MODE0));
+        digitalWrite((uint8_t)cs_pin_, LOW);
+        s->transfer(0x02);  // INSTRUCTION_WRITE
+        s->transfer(reg);
+        s->transfer(value);
+        digitalWrite((uint8_t)cs_pin_, HIGH);
+        s->endTransaction();
+    }
+
     // autowp flags extended / remote frames in can_id (a remote frame's data
     // bytes are whatever the previous frame left in the buffer).
     static void to_frame(const struct can_frame &f, CanFrame &frame) {
@@ -797,6 +824,52 @@ public:
             if (mcp_.setConfigMode() != MCP2515::ERROR_OK) mcp_.reset();
         }
         installed_ = false;
+    }
+
+    // Deep-sleep hand-off. shutdown() above would park the chip in CONFIG mode:
+    // off the bus, blind, and with INT never asserted again, so can1 could not
+    // wake the board. Listen-Only is what we want instead — it still receives
+    // and still drives INT on a received frame, but never transmits and never
+    // ACKs, so the car's bus is untouched while the ESP32 is asleep.
+    void prepareForSleep() override {
+        stop_rx_task();   // also detaches the ESP32-side pin interrupt
+        if (!chip_detected_) return;
+        {
+            SpiLock lock(spi_mutex_);
+            // 0x2B = CANINTE, armed for received frames only (0x01 RX0IE +
+            // 0x02 RX1IE). reset() had also armed ERRIE/MERRE; an error or
+            // overflow flag latched during the sleep would pin INT low and
+            // wake the board in a loop.
+            mcp_write_reg(0x2B, 0x01 | 0x02);
+            mcp_.clearRXnOVRFlags();   // 0x2D EFLG: drop any RX overflow flags
+            mcp_.clearInterrupts();    // 0x2C CANINTF = 0 -> INT de-asserts
+#if defined(SLEEP_MCP2515_LOWPOWER)
+            // Optional, off by default: the chip's own sleep mode with
+            // wake-on-bus. Needs WAKIE on top of the mask above, otherwise
+            // nothing asserts INT when the bus comes alive and the board
+            // never wakes. Untested on real hardware — leave it off unless
+            // you can recover the board by power-cycling it.
+            mcp_write_reg(0x2B, 0x01 | 0x02 | 0x40);  // + WAKIE
+            mcp_write_reg(0x2C, 0x00);
+            mcp_.setSleepMode();
+#else
+            mcp_.setListenOnlyMode();
+#endif
+        }
+        installed_   = false;  // nothing may TX through a controller we're leaving behind
+        listen_only_ = true;
+        // INT is open-drain and most modules ship no pull-up. The ESP32 pull-up
+        // only survives deep sleep on an RTC GPIO with the RTC_PERIPH domain
+        // kept on — main.cpp does both before it sleeps.
+        if (int_pin_ >= 0) pinMode((uint8_t)int_pin_, INPUT_PULLUP);
+        Serial.printf("[CAN] %s MCP2515 parked %s — INT (GPIO %d) armed to wake\n",
+                      label_,
+#if defined(SLEEP_MCP2515_LOWPOWER)
+                      "in chip sleep (wake-on-bus)",
+#else
+                      "in Listen-Only",
+#endif
+                      int_pin_);
     }
 
     void setRxTask(bool on) override {
@@ -1359,6 +1432,13 @@ void can_shutdown_all(CanDriver **buses, uint8_t count) {
         if (buses[i]) buses[i]->shutdown();
     }
     Serial.println("[CAN] Controllers stopped — bus released");
+}
+
+void can_prepare_sleep_all(CanDriver **buses, uint8_t count) {
+    for (uint8_t i = 0; i < count; i++) {
+        if (buses[i]) buses[i]->prepareForSleep();
+    }
+    Serial.println("[CAN] Controllers parked for deep sleep — no TX, no ACK");
 }
 
 #if !defined(CAN_DRIVER_TWAI) && !defined(CAN_DRIVER_MCP2515) && !defined(CAN_DRIVER_T2CAN_DUAL)

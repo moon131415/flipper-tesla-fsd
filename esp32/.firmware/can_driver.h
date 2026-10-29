@@ -130,6 +130,15 @@ public:
     /** Stop TX/ACK and release the bus before a reboot. Default no-op. */
     virtual void shutdown() {}
 
+    /** Put the controller into the state it must keep across a deep sleep.
+     *
+     *  The default is shutdown(): quiet and off the bus, which is right for a
+     *  reboot. A controller that can also act as a wake source overrides this
+     *  to stay listening while still transmitting nothing — see
+     *  Mcp2515Driver, which parks the chip in Listen-Only with its INT pin
+     *  armed so a frame on can1 raises the ESP32's ext1 wakeup. */
+    virtual void prepareForSleep() { shutdown(); }
+
     /** MCP2515 only: read the chip from a FreeRTOS task into a queue instead
      *  of from the loop (opt-in). Takes effect at once when the controller is
      *  up, else at the next successful begin(). Default no-op. */
@@ -161,3 +170,8 @@ CanErrorSplit can_error_split(CanDriver **buses, uint8_t count);
  *  deep sleep, so no controller is still transmitting or ACKing when the chip
  *  resets or powers down. */
 void can_shutdown_all(CanDriver **buses, uint8_t count);
+
+/** Park every non-null driver for deep sleep: TX and ACK off, but a controller
+ *  that can wake the chip stays on the bus as a silent listener. Call instead
+ *  of can_shutdown_all() on the way into esp_deep_sleep_start(). */
+void can_prepare_sleep_all(CanDriver **buses, uint8_t count);
